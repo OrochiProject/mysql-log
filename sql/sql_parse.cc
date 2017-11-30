@@ -107,6 +107,162 @@
 using std::max;
 using std::min;
 
+#include <string>
+#include <vector>
+#include <string.h>
+//#include <atomic>
+
+// cheng-hack: a flag to open/close logging all sql statement
+// instead of only logging statement with (rid, opnum)
+bool global_log_all_sql = false;
+
+uint64_t my_global_atomic_seq = 0;
+//std::vector<std::string*> global_log_queue;
+//pthread_mutex_t global_log_lock;
+
+bool lingfan_check_rid_opnum(THD* thd) {
+    if (thd->lingfan_in_trx <= 0) {
+        return false;
+    }
+    int rid, opnum;
+    sscanf(thd->query(), "/*%d,%d*/", &rid, &opnum);
+    return rid == thd->lingfan_rid && opnum == thd->lingfan_opnum;
+}
+
+void lingfan_generate_error(THD* thd, const char* errorMsg) {
+    char tmp[256];
+    snprintf(tmp, 256, "#&#error#&#error#&#%s", errorMsg);
+    *(thd->lingfan_trx_cache)+=tmp;
+}
+
+void lingfan_real_log(THD* thd, int res, int type, bool& query_logged);
+void lingfan_enter_trx(THD* thd, int res, bool& query_logged) {
+    if (thd->lingfan_in_trx == 0) { // record rid, opnum
+        thd->lingfan_trx_readwrite = 0;
+        char tmp[128];
+        snprintf(tmp, 128, "%s#&#%s#&#", "write", (res==0)?"true":"false");
+        thd->lingfan_trx_cache = new std::string(tmp);
+        *(thd->lingfan_trx_cache)+=(strstr(thd->query(),"*/")+2);
+        query_logged = true;
+        int rid, opnum;
+        sscanf(thd->query(), "/*%d,%d*/", &rid, &opnum);
+        thd->lingfan_rid = rid;
+        thd->lingfan_opnum = opnum;
+    } else {
+        // generate error msg, already in trx
+        lingfan_generate_error(thd, "already in trx, starting a nested trx");
+        lingfan_real_log(thd, res, 1, query_logged);
+    }
+    thd->lingfan_in_trx++;
+}
+
+void lingfan_flush_trx(THD* thd, int res, uint64_t ts) {
+    char tmp[128];
+    snprintf(tmp, 128, "%lu,%d,%d/*%d,%d*/", ts, 2, res, thd->lingfan_rid, thd->lingfan_opnum);
+    std::string* str = new std::string(tmp);
+    *str+=*(thd->lingfan_trx_cache);
+    thd->lingfan_query_log_queue.push_back(str);
+}
+
+void lingfan_leave_trx(THD* thd, int res, uint64_t ts) {
+    if (thd->lingfan_in_trx <= 0) {
+        // generate error msg, no open trx
+        lingfan_generate_error(thd, "commit or rollback called outside trx");
+    } else {
+        thd->lingfan_in_trx--;
+        if (thd->lingfan_in_trx == 0) { // clear rid, opnum
+            lingfan_flush_trx(thd, res, ts);
+            thd->lingfan_rid = 0;
+            thd->lingfan_opnum = 0;
+            delete thd->lingfan_trx_cache;
+            thd->lingfan_trx_cache = NULL;
+            thd->lingfan_trx_readwrite = 0;
+        }
+    }
+}
+
+bool lingfan_query_need_log(THD* thd, bool query_logged) {
+    if (query_logged) {
+        return false;
+    }
+    if (global_log_all_sql) {
+        return true;
+    }
+    int rid, opnum;
+    int n_read = sscanf(thd->query(), "/*%d,%d*/", &rid, &opnum);
+    return n_read == 2;
+    //return !query_logged && (global_log_all_sql || (strncmp(thd->query(), "/*", 2) == 0));
+}
+
+void lingfan_normal_query_log(THD* thd, int res, int type, bool& query_logged) {
+    uint64_t ts = __sync_fetch_and_add(&my_global_atomic_seq, (uint64_t)1);
+    char tmp[128];
+    snprintf(tmp, 128, "%lu,%d,%d", ts, type, res);
+    std::string* str = new std::string(tmp);
+    *str+=thd->query();
+    thd->lingfan_query_log_queue.push_back(str);
+    query_logged = true;
+}
+
+void lingfan_real_log(THD* thd, int res, int type, bool& query_logged) {
+    if (thd->lingfan_in_trx > 0) { // in trx
+        bool same = lingfan_check_rid_opnum(thd);
+        if (!same) {
+            // generate error msg, rid opnum changed
+            lingfan_generate_error(thd, "rid opnum changed within trx!");
+        }
+        char tmp[128];
+        snprintf(tmp, 128, "#&#%s#&#%s#&#", (type==0)?"read":"write", (res==0)?"true":"false");
+        *(thd->lingfan_trx_cache)+=tmp;
+        *(thd->lingfan_trx_cache)+=(strstr(thd->query(),"*/")+2);
+        thd->lingfan_trx_readwrite+=type;
+        query_logged = true;
+    } else { // not in trx
+        lingfan_normal_query_log(thd, res, type, query_logged);
+    }
+}
+
+void lingfan_query_log_append(THD* thd, int res, int type, bool& query_logged) {
+    if (lingfan_query_need_log(thd, query_logged)) {
+        lingfan_real_log(thd, res, type, query_logged);
+    }
+}
+
+void lingfan_begin(THD* thd, int res, bool &query_logged) {
+    if (!lingfan_query_need_log(thd, query_logged)) {
+        return;
+    }
+    if (global_log_all_sql) {
+        lingfan_normal_query_log(thd, res, 1, query_logged);
+    } else {
+        lingfan_enter_trx(thd, res, query_logged);
+    }
+}
+
+void lingfan_commit(THD* thd, int res, bool & query_logged, uint64_t ts) {
+    if (!lingfan_query_need_log(thd, query_logged)) {
+        return;
+    }
+    if (global_log_all_sql) {
+        lingfan_normal_query_log(thd, res, 1, query_logged);
+    } else {
+        lingfan_real_log(thd, res, 1, query_logged);
+        lingfan_leave_trx(thd, res, ts);
+    }
+}
+
+void lingfan_rollback(THD* thd, int res, bool & query_logged, uint64_t ts) {
+    if (!lingfan_query_need_log(thd, query_logged)) {
+        return;
+    }
+    if (global_log_all_sql) {
+        lingfan_normal_query_log(thd, res, 1, query_logged);
+    } else {
+        lingfan_real_log(thd, res, 1, query_logged);
+        lingfan_leave_trx(thd, 1, ts);
+    }
+}
+
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
 /**
@@ -2285,7 +2441,9 @@ int
 mysql_execute_command(THD *thd)
 {
   int res= FALSE;
+  int my_tmp_res=FALSE;
   int  up_result= 0;
+  bool query_logged = false;
   LEX  *lex= thd->lex;
   /* first SELECT_LEX (have special meaning for many of non-SELECTcommands) */
   SELECT_LEX *select_lex= &lex->select_lex;
@@ -2653,6 +2811,7 @@ mysql_execute_command(THD *thd)
       break;
 
     res= execute_sqlcom_select(thd, all_tables);
+    lingfan_query_log_append(thd, res, 0, query_logged);
     break;
   }
 case SQLCOM_PREPARE:
@@ -3313,8 +3472,10 @@ end_with_restore_list:
                                   &found, &updated));
     MYSQL_UPDATE_DONE(res, found, updated);
     /* mysql_update return 2 if we need to switch to multi-update */
-    if (up_result != 2)
+    if (up_result != 2) {
+      lingfan_query_log_append(thd, res, 1, query_logged);
       break;
+    }
     /* Fall through */
   }
   case SQLCOM_UPDATE_MULTI:
@@ -3389,6 +3550,7 @@ end_with_restore_list:
         MYSQL_MULTI_UPDATE_DONE(1, 0, 0);
       }
     }
+    lingfan_query_log_append(thd, res, 1, query_logged);
     break;
   }
   case SQLCOM_REPLACE:
@@ -3467,6 +3629,7 @@ end_with_restore_list:
                       DBUG_ASSERT(!debug_sync_set_action(current_thd,
                                                          STRING_WITH_LEN(act)));
                     };);
+    lingfan_query_log_append(thd, res, 1, query_logged);
     break;
   }
   case SQLCOM_REPLACE_SELECT:
@@ -3558,6 +3721,7 @@ end_with_restore_list:
       thd->first_successful_insert_id_in_cur_stmt=
         thd->first_successful_insert_id_in_prev_stmt;
 
+    lingfan_query_log_append(thd, res, 1, query_logged);
     break;
   }
   case SQLCOM_DELETE:
@@ -3573,6 +3737,7 @@ end_with_restore_list:
                        &select_lex->order_list,
                        unit->select_limit_cnt, select_lex->options);
     MYSQL_DELETE_DONE(res, (ulong) thd->get_row_count_func());
+    lingfan_query_log_append(thd, res, 1, query_logged);
     break;
   }
   case SQLCOM_DELETE_MULTI:
@@ -3632,6 +3797,7 @@ end_with_restore_list:
       res= TRUE;                                // Error
       MYSQL_MULTI_DELETE_DONE(1, 0);
     }
+    lingfan_query_log_append(thd, res, 1, query_logged);
     break;
   }
   case SQLCOM_DROP_TABLE:
@@ -4262,7 +4428,9 @@ end_with_restore_list:
   }
 #endif
   case SQLCOM_BEGIN:
-    if (trans_begin(thd, lex->start_transaction_opt))
+    my_tmp_res = trans_begin(thd, lex->start_transaction_opt);
+    lingfan_begin(thd, my_tmp_res, query_logged);
+    if (my_tmp_res)
       goto error;
     my_ok(thd);
     break;
@@ -4276,7 +4444,13 @@ end_with_restore_list:
     bool tx_release= (lex->tx_release == TVL_YES ||
                       (thd->variables.completion_type == 2 &&
                        lex->tx_release != TVL_NO));
-    if (trans_commit(thd))
+    uint64_t lingfan_ts = 0;
+    if (lingfan_query_need_log(thd, query_logged)) {
+        lingfan_ts = __sync_fetch_and_add(&my_global_atomic_seq, (uint64_t)1);
+    }
+    my_tmp_res = trans_commit(thd);
+    lingfan_commit(thd, my_tmp_res, query_logged, lingfan_ts);
+    if (my_tmp_res)
       goto error;
     thd->mdl_context.release_transactional_locks();
     /* Begin transaction with the same isolation level. */
@@ -4307,7 +4481,13 @@ end_with_restore_list:
     bool tx_release= (lex->tx_release == TVL_YES ||
                       (thd->variables.completion_type == 2 &&
                        lex->tx_release != TVL_NO));
-    if (trans_rollback(thd))
+    uint64_t lingfan_ts = 0;
+    if (lingfan_query_need_log(thd, query_logged)) {
+        lingfan_ts = __sync_fetch_and_add(&my_global_atomic_seq, (uint64_t)1);
+    }
+    my_tmp_res = trans_rollback(thd);
+    lingfan_rollback(thd, my_tmp_res, query_logged, lingfan_ts);
+    if (my_tmp_res)
       goto error;
     thd->mdl_context.release_transactional_locks();
     /* Begin transaction with the same isolation level. */
@@ -5013,6 +5193,7 @@ error:
   res= TRUE;
 
 finish:
+  lingfan_query_log_append(thd, res, 1, query_logged);
 
   DBUG_ASSERT(!thd->in_active_multi_stmt_transaction() ||
                thd->in_multi_stmt_transaction_mode());

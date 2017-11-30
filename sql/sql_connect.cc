@@ -36,6 +36,11 @@
 #include "sql_callback.h"
 
 #include <algorithm>
+#include <string>
+#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 using std::min;
 using std::max;
@@ -61,6 +66,8 @@ using std::max;
 /*
   Get structure for logging connection data for the current user
 */
+
+extern uint64_t my_global_atomic_seq;
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
 static HASH hash_user_connections;
@@ -925,6 +932,21 @@ bool thd_is_connection_alive(THD *thd)
   return FALSE;
 }
 
+// cheng-hack: make /tmp/sql_log dir
+void sql_mkdir()
+{
+  if (access("/tmp/sql_log/", R_OK|W_OK) != 0) {
+    if (mkdir("/tmp/sql_log/", 0755) !=0 ) {
+        FILE* debugfp=fopen("/tmp/mysql.debug", "a");
+        fprintf(debugfp, "error create /tmp/sql_log/\n");
+        fclose(debugfp);
+    }
+  }
+}
+
+// cheng-hack: the flag defined in sql_parse.cc
+extern bool global_log_all_sql;
+
 void do_handle_one_connection(THD *thd_arg)
 {
   THD *thd= thd_arg;
@@ -982,6 +1004,73 @@ void do_handle_one_connection(THD *thd_arg)
       if (do_command(thd))
   break;
     }
+    if (thd->lingfan_in_trx > 0) { // uncommitted trx, flush
+        uint64_t ts = __sync_fetch_and_add(&my_global_atomic_seq, (uint64_t)1);
+        char tmp[128];
+        int ret_val = 0;
+        if (thd->lingfan_trx_readwrite > 0) {
+            ret_val = 1;
+        }
+        snprintf(tmp, 128, "%lu,%d,%d/*%d,%d*/", ts, 2, ret_val, thd->lingfan_rid, thd->lingfan_opnum);
+        std::string* str = new std::string(tmp);
+        *str+=*(thd->lingfan_trx_cache);
+        thd->lingfan_query_log_queue.push_back(str);
+        delete thd->lingfan_trx_cache;
+        thd->lingfan_in_trx = 0;
+        thd->lingfan_trx_cache = NULL;
+        thd->lingfan_rid = 0;
+        thd->lingfan_opnum = 0;
+        thd->lingfan_trx_readwrite = 0;
+    }
+    if (thd->lingfan_query_log_queue.size()>0) { // dump thread log
+        sql_mkdir();
+        // FIXME: two random_id can be the same which breaks the correctness
+        int random_id = rand();
+        char filename[128];
+        snprintf(filename, 128, "/tmp/sql_log/%d.log", random_id);
+        FILE* fp=fopen(filename, "a");
+        for (unsigned int i=0;i<thd->lingfan_query_log_queue.size();i++) {
+            std::string* str = thd->lingfan_query_log_queue[i];
+
+            // If global_log_all_sql is set, simplly log all the sql
+            if (global_log_all_sql) {
+                fprintf(fp, "%s\n",str->c_str()); 
+                delete str;
+            } else {
+                // This is the TRUE access/exec db log
+                int rid, opnum, type, retval;
+                uint64_t ts=0;
+                sscanf(str->c_str(), "%lu,%d,%d/*%d,%d*/", &ts, &type, &retval, &rid, &opnum);
+                const char* optype;
+                if (type==0) {
+                    optype="read";
+                } else if (type == 1) {
+                    optype="write";
+                } else if (type == 2) {
+                    optype="txn";
+                }
+                const char* ret;
+                if (retval==0) {
+                    ret="true";
+                } else {
+                    ret="false";
+                }
+                fprintf(fp, "|[|%lu::%d#&#%d#&#%s#&#%s#&#%s|]|", ts, rid, opnum, optype, ret, strstr(str->c_str(),"*/")+2);
+                delete str;
+            }
+        }
+        fprintf(fp, "END");
+        fclose(fp);
+        thd->lingfan_query_log_queue.clear();
+    }
+
+    {
+        double time_elapsed = (double)clock() / CLOCKS_PER_SEC * 1000;
+        FILE* fp = fopen("/tmp/mysql_log_cpu_time.log", "a");
+        fprintf(fp, "%f\n", time_elapsed);
+        fclose(fp);
+    }
+
     end_connection(thd);
 
 end_thread:

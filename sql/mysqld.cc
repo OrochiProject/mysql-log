@@ -117,10 +117,17 @@
 #endif
 #include "table_cache.h" // table_cache_manager
 
+//#include <string>
+//#include <unistd.h>
+#include <time.h>
+#include <stdlib.h>
+
 using std::min;
 using std::max;
 using std::vector;
 
+//extern std::vector<std::string*> global_log_queue;
+//extern pthread_mutex_t global_log_lock;
 #define mysqld_charset &my_charset_latin1
 
 /* We have HAVE_purify below as this speeds up the shutdown of MySQL */
@@ -5237,16 +5244,41 @@ static void test_lc_time_sz()
 }
 #endif//DBUG_OFF
 
+/*
+void* my_consumer(void* args) {
+    while (true) {
+        pthread_mutex_lock(&global_log_lock);
+        if (global_log_queue.size() > 0) {
+            FILE* fp = fopen("/tmp/query_history.log", "a");
+            for (unsigned int i = 0; i < global_log_queue.size(); i++) {
+                fprintf(fp, "%s\n", global_log_queue[i]->c_str());
+                delete global_log_queue[i];
+            }
+            fclose(fp);
+            global_log_queue.clear();
+        }
+        pthread_mutex_unlock(&global_log_lock);
+        sleep(1);
+    }
+    return NULL;
+}
+*/
 #ifdef __WIN__
 int win_main(int argc, char **argv)
 #else
 int mysqld_main(int argc, char **argv)
 #endif
 {
+    srand(time(NULL));
   /*
     Perform basic thread library and malloc initialization,
     to be able to read defaults files and parse options.
   */
+/*
+  pthread_mutex_init(&global_log_lock, NULL);
+  pthread_t my_log_consumer;
+  pthread_create(&my_log_consumer, NULL, my_consumer, NULL);
+*/
   my_progname= argv[0];
 
 #ifndef _WIN32

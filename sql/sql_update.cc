@@ -189,7 +189,6 @@ static bool check_constant_expressions(List<Item> &values)
   DBUG_RETURN(true);
 }
 
-
 /*
   Process usual UPDATE
 

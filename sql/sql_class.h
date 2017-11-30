@@ -46,6 +46,8 @@
 #include <mysql_com_server.h>
 #include "sql_data_change.h"
 #include "my_atomic.h"
+#include <string>
+#include <vector>
 
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
@@ -2107,6 +2109,12 @@ private:
 
 public:
   MDL_context mdl_context;
+  std::vector<std::string*> lingfan_query_log_queue;
+  int lingfan_in_trx;
+  std::string* lingfan_trx_cache;
+  int lingfan_rid;
+  int lingfan_opnum;
+  int lingfan_trx_readwrite;
 
   /* Used to execute base64 coded binlog events in MySQL server */
   Relay_log_info* rli_fake;

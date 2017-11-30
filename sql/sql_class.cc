@@ -930,6 +930,13 @@ THD::THD(bool enable_plugins)
    m_stmt_da(&main_da),
    duplicate_slave_id(false)
 {
+  lingfan_in_trx = 0;
+  lingfan_trx_cache = NULL;
+  lingfan_rid = 0;
+  lingfan_opnum = 0;
+  lingfan_trx_readwrite = 0;
+  lingfan_query_log_queue.clear();
+
   ulong tmp;
 
   mdl_context.init(this);

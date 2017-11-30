@@ -1,0 +1,13 @@
+How to compile:
+Make sure you git checkout branch 5.6 and have all prerequisite for compiling
+cd mysql-server && ./BUILD/compile-pentium
+
+How to install:
+Please read mysql-server/run_mysql.sh and change some details like paths, username, and root password
+You need root previlege probably
+Please note: run_mysql.sh use 'rm -rf' to delete current mysql server. Make sure you truly know the consequence before running the script.
+
+How to use:
+mysql server will create temporary log file (named *.log) in /tmp folder
+copy mysql-server/mergy.py to anywhere and run it. This script merges log files in /tmp folder every 3 seconds and dump logs into log.txt
+Please note: log.txt is in the current folder (where you run mergy.py)
